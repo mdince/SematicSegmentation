@@ -3,18 +3,17 @@ import cv2
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
-
 #for GPU
-from tensorflow.keras.mixed_precision import experimental as mixed_precision
-policy = mixed_precision.Policy('mixed_float16') 
-mixed_precision.set_policy(policy)
+from tensorflow.keras import mixed_precision
 
-
+# Enable mixed precision
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_global_policy(policy)
 
 print(tf.__version__)
 
 # Define your image dimensions and number of classes
-IMG_HEIGHT, IMG_WIDTH, IMG_CHANNELS = 256, 512, 3  # Resized dimensions for input
+IMG_HEIGHT, IMG_WIDTH, IMG_CHANNELS = 128, 256, 3  # Resized dimensions for input
 NUM_CLASSES = 34  # Cityscapes has 34 classes
 
 # Visualize the prediction
@@ -65,42 +64,50 @@ def plot_training_history(history):
     plt.tight_layout()
     plt.show()
 
-# Example function to visualize an image and its label
-def visualize_image_and_label(image, label):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+def visualize_prediction(image, prediction): #add label to see label too
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     
-    # Display the image
+    # Display the input image
     axes[0].imshow(image)
-    axes[0].set_title("Image")
+    axes[0].set_title("Input Image")
     axes[0].axis('off')
     
-    # Display the label (using argmax to get class for each pixel)
-    axes[1].imshow(np.argmax(label, axis=-1), cmap='nipy_spectral')  # You can change the colormap for better visualization
-    axes[1].set_title("Label")
+    # Display the true label
+    #axes[1].imshow(np.argmax(label, axis=-1), cmap='nipy_spectral')  # Use proper colormap for segmentation
+    #axes[1].set_title("True Label")
+    #axes[1].axis('off')
+    
+    # Display the predicted label
+    axes[1].imshow(np.argmax(prediction, axis=-1)[0], cmap='nipy_spectral')  # Taking the first prediction
+    axes[1].set_title("Predicted Label")
     axes[1].axis('off')
     
     plt.tight_layout()
     plt.show()
 
-# Preprocessing function for image and label
+
 def preprocess_image_label(image_path, label_path):
-    image_path = image_path.numpy().decode('utf-8')
-    label_path = label_path.numpy().decode('utf-8')
+    # Read and decode the image from the file path tensor
+    image = tf.io.read_file(image_path)
+    image = tf.image.decode_image(image, channels=IMG_CHANNELS)  # Assuming RGB image
+    image = tf.image.resize(image, [IMG_HEIGHT, IMG_WIDTH])
+    image = image / 255.0  # Normalize to [0, 1] range
     
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image = cv2.resize(image, (IMG_WIDTH, IMG_HEIGHT))
-    image = image / 255.0
+    # Read and decode the label from the file path tensor (grayscale)
+    label = tf.io.read_file(label_path)
+    label = tf.image.decode_image(label, channels=1)  # Grayscale image for segmentation masks
+    label = tf.image.resize(label, [IMG_HEIGHT, IMG_WIDTH], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
     
-    label = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
-    label = cv2.resize(label, (IMG_WIDTH, IMG_HEIGHT), interpolation=cv2.INTER_NEAREST)
-    
-    # One-hot encode the labels
-    label_one_hot = np.zeros((IMG_HEIGHT, IMG_WIDTH, NUM_CLASSES), dtype=np.uint8)
-    for c in range(NUM_CLASSES):
-        label_one_hot[:, :, c] = (label == c).astype(int)
-    
+    # One-hot encode the label
+    label_one_hot = tf.one_hot(tf.squeeze(label, axis=-1), depth=NUM_CLASSES, axis=-1)
+
+    #Get unique labels from one-hot encoded labels
+    #unique_labels = tf.unique(tf.reshape(tf.argmax(label_one_hot, axis=-1), [-1]))[0]
+
+    #print(f"Processed image shape: {image.shape}, Label shape: {label_one_hot.shape}, Unique labels: {unique_labels.numpy()}")
+
     return image, label_one_hot
+
 
 def data_generator(image_paths, label_paths, batch_size):
     # Create a TensorFlow dataset
@@ -131,66 +138,105 @@ image_paths_test = sorted([os.path.join(dp, f) for dp, dn, filenames in os.walk(
 label_paths_test = sorted([os.path.join(dp, f) for dp, dn, filenames in os.walk('cityscapes/gtFine/test') for f in filenames if f.endswith('labelIds.png')])
 
 # Set batch size and create the ttrain, val, and test datasets
-batch_size = 16
+batch_size = 64
 train_dataset = data_generator(image_paths_train, label_paths_train, batch_size).repeat()
 val_dataset = data_generator(image_paths_val, label_paths_val, batch_size).repeat()
-test_dataset = data_generator(image_paths_test, label_paths_test, batch_size)
-
+test_dataset = data_generator(image_paths_val, label_paths_val, batch_size)
 
 inputs = tf.keras.layers.Input((IMG_HEIGHT, IMG_WIDTH, IMG_CHANNELS))
-#going downwards
-c1 = tf.keras.layers.Conv2D(16, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(inputs)
-#16 -> number of filters (kernels), 3,3 -> kernel size matrix, kernel init. -> starting values of weights, normal distribution centered around zeros, same -> output has the same size as the input
+
+c1 = tf.keras.layers.Conv2D(4, (5, 5), kernel_initializer='he_normal', padding='same')(inputs)
+#4 -> number of filters (kernels), 5,5 -> kernel size matrix, kernel init. -> starting values of weights, normal distribution centered around zeros, same -> output has the same size as the input
+c1 = tf.keras.layers.BatchNormalization()(c1)  # Add Batch Normalization
+c1 = tf.keras.layers.Activation('relu')(c1)  # Activation after Batch Norm
 c1 = tf.keras.layers.Dropout(0.1)(c1) #to prevent overfitting %10
-c1 = tf.keras.layers.Conv2D(16, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(c1)
-p1 = tf.keras.layers.MaxPooling2D((2,2))(c1) #to keep the highest value from every 2x2, resulting reducing the size
+c1 = tf.keras.layers.Conv2D(4, (5, 5), kernel_initializer='he_normal', padding='same')(c1)
+c1 = tf.keras.layers.BatchNormalization()(c1)
+c1 = tf.keras.layers.Activation('relu')(c1)
+p1 = tf.keras.layers.MaxPooling2D((2, 2))(c1) #to keep the highest value from every 2x2, resulting reducing the size
 
-c2 = tf.keras.layers.Conv2D(32, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(p1)
+# Second block
+c2 = tf.keras.layers.Conv2D(8, (5, 5), kernel_initializer='he_normal', padding='same')(p1)
+c2 = tf.keras.layers.BatchNormalization()(c2)
+c2 = tf.keras.layers.Activation('relu')(c2)
 c2 = tf.keras.layers.Dropout(0.1)(c2)
-c2 = tf.keras.layers.Conv2D(32, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(c2)
-p2 = tf.keras.layers.MaxPooling2D((2,2))(c2)
+c2 = tf.keras.layers.Conv2D(8, (5, 5), kernel_initializer='he_normal', padding='same')(c2)
+c2 = tf.keras.layers.BatchNormalization()(c2)
+c2 = tf.keras.layers.Activation('relu')(c2)
+p2 = tf.keras.layers.MaxPooling2D((2, 2))(c2)
 
-c3 = tf.keras.layers.Conv2D(64, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(p2)
+# Third block
+c3 = tf.keras.layers.Conv2D(16, (3, 3), kernel_initializer='he_normal', padding='same')(p2)
+c3 = tf.keras.layers.BatchNormalization()(c3)
+c3 = tf.keras.layers.Activation('relu')(c3)
 c3 = tf.keras.layers.Dropout(0.2)(c3)
-c3 = tf.keras.layers.Conv2D(64, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(c3)
-p3 = tf.keras.layers.MaxPooling2D((2,2))(c3)
+c3 = tf.keras.layers.Conv2D(16, (3, 3), kernel_initializer='he_normal', padding='same')(c3)
+c3 = tf.keras.layers.BatchNormalization()(c3)
+c3 = tf.keras.layers.Activation('relu')(c3)
+p3 = tf.keras.layers.MaxPooling2D((2, 2))(c3)
 
-c4 = tf.keras.layers.Conv2D(128, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(p3)
+# Fourth block
+c4 = tf.keras.layers.Conv2D(32, (3, 3), kernel_initializer='he_normal', padding='same')(p3)
+c4 = tf.keras.layers.BatchNormalization()(c4)
+c4 = tf.keras.layers.Activation('relu')(c4)
 c4 = tf.keras.layers.Dropout(0.2)(c4)
-c4 = tf.keras.layers.Conv2D(128, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(c4)
-p4 = tf.keras.layers.MaxPooling2D((2,2))(c4)
+c4 = tf.keras.layers.Conv2D(32, (3, 3), kernel_initializer='he_normal', padding='same')(c4)
+c4 = tf.keras.layers.BatchNormalization()(c4)
+c4 = tf.keras.layers.Activation('relu')(c4)
+p4 = tf.keras.layers.MaxPooling2D((2, 2))(c4)
 
-c5 = tf.keras.layers.Conv2D(256, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(p4)
+# Fifth block
+c5 = tf.keras.layers.Conv2D(64, (3, 3), kernel_initializer='he_normal', padding='same')(p4)
+c5 = tf.keras.layers.BatchNormalization()(c5)
+c5 = tf.keras.layers.Activation('relu')(c5)
 c5 = tf.keras.layers.Dropout(0.3)(c5)
-c5 = tf.keras.layers.Conv2D(256, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(c5)
+c5 = tf.keras.layers.Conv2D(64, (3, 3), kernel_initializer='he_normal', padding='same')(c5)
+c5 = tf.keras.layers.BatchNormalization()(c5)
+c5 = tf.keras.layers.Activation('relu')(c5)
 
-#going upwards
-u6 = tf.keras.layers.Conv2DTranspose(128, (2,2), strides=(2,2), padding='same')(c5)
+# Going upwards
+u6 = tf.keras.layers.Conv2DTranspose(32, (2, 2), strides=(2, 2), padding='same')(c5)
 #transpose conv2D -> to increse dimension opposite of conv2D(upsample), 128 -> number of filters (kernels), (2,2)-> kernel size, strides-> how much filter moves and means output size will be doubled (upsamples)
 u6 = tf.keras.layers.concatenate([u6, c4]) #concatenate to provide richer information by combining features from different stages, channel sizes are added together
-c6 = tf.keras.layers.Conv2D(128, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(u6)
+c6 = tf.keras.layers.Conv2D(32, (3, 3), kernel_initializer='he_normal', padding='same')(u6)
+c6 = tf.keras.layers.BatchNormalization()(c6)
+c6 = tf.keras.layers.Activation('relu')(c6)
 c6 = tf.keras.layers.Dropout(0.2)(c6)
-c6 = tf.keras.layers.Conv2D(128, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(c6)
+c6 = tf.keras.layers.Conv2D(32, (3, 3), kernel_initializer='he_normal', padding='same')(c6)
+c6 = tf.keras.layers.BatchNormalization()(c6)
+c6 = tf.keras.layers.Activation('relu')(c6)
 
-u7 = tf.keras.layers.Conv2DTranspose(64, (2,2), strides=(2,2), padding='same')(c6)
-u7 = tf.keras.layers.concatenate([u7, c3]) 
-c7 = tf.keras.layers.Conv2D(64, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(u7)
+u7 = tf.keras.layers.Conv2DTranspose(16, (2, 2), strides=(2, 2), padding='same')(c6)
+u7 = tf.keras.layers.concatenate([u7, c3])
+c7 = tf.keras.layers.Conv2D(16, (3, 3), kernel_initializer='he_normal', padding='same')(u7)
+c7 = tf.keras.layers.BatchNormalization()(c7)
+c7 = tf.keras.layers.Activation('relu')(c7)
 c7 = tf.keras.layers.Dropout(0.2)(c7)
-c7 = tf.keras.layers.Conv2D(64, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(c7)
+c7 = tf.keras.layers.Conv2D(16, (3, 3), kernel_initializer='he_normal', padding='same')(c7)
+c7 = tf.keras.layers.BatchNormalization()(c7)
+c7 = tf.keras.layers.Activation('relu')(c7)
 
-u8 = tf.keras.layers.Conv2DTranspose(32, (2,2), strides=(2,2), padding='same')(c7)
-u8 = tf.keras.layers.concatenate([u8, c2]) 
-c8 = tf.keras.layers.Conv2D(32, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(u8)
+u8 = tf.keras.layers.Conv2DTranspose(8, (2, 2), strides=(2, 2), padding='same')(c7)
+u8 = tf.keras.layers.concatenate([u8, c2])
+c8 = tf.keras.layers.Conv2D(8, (5, 5), kernel_initializer='he_normal', padding='same')(u8)
+c8 = tf.keras.layers.BatchNormalization()(c8)
+c8 = tf.keras.layers.Activation('relu')(c8)
 c8 = tf.keras.layers.Dropout(0.1)(c8)
-c8 = tf.keras.layers.Conv2D(32, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(c8)
+c8 = tf.keras.layers.Conv2D(8, (5, 5), kernel_initializer='he_normal', padding='same')(c8)
+c8 = tf.keras.layers.BatchNormalization()(c8)
+c8 = tf.keras.layers.Activation('relu')(c8)
 
-u9 = tf.keras.layers.Conv2DTranspose(16, (2,2), strides=(2,2), padding='same')(c8)
+u9 = tf.keras.layers.Conv2DTranspose(4, (2, 2), strides=(2, 2), padding='same')(c8)
 u9 = tf.keras.layers.concatenate([u9, c1], axis=3) #concatenate along the channel axis, default value '-1' -> last dimension
-c9 = tf.keras.layers.Conv2D(16, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(u9)
+c9 = tf.keras.layers.Conv2D(4, (5, 5), kernel_initializer='he_normal', padding='same')(u9)
+c9 = tf.keras.layers.BatchNormalization()(c9)
+c9 = tf.keras.layers.Activation('relu')(c9)
 c9 = tf.keras.layers.Dropout(0.1)(c9)
-c9 = tf.keras.layers.Conv2D(16, (3,3), activation='relu', kernel_initializer='he_normal', padding='same')(c9)
+c9 = tf.keras.layers.Conv2D(4, (5, 5), kernel_initializer='he_normal', padding='same')(c9)
+c9 = tf.keras.layers.BatchNormalization()(c9)
+c9 = tf.keras.layers.Activation('relu')(c9)
 
-outputs = tf.keras.layers.Conv2D(34, (1,1), activation='softmax')(c9) #1 -> 34 feature maps for 34 classes, (1,1)-> pointwise convolution, sigmoid -> binary classification
+outputs = tf.keras.layers.Conv2D(34, (1, 1), activation='softmax')(c9)  #1 -> 34 feature maps for 34 classes, (1,1)-> pointwise convolution, sigmoid -> binary classification
 
 
 model = tf.keras.Model(inputs=[inputs], outputs=[outputs])
@@ -214,22 +260,28 @@ history = model.fit(train_dataset,
                     validation_data=val_dataset, 
                     steps_per_epoch=steps_per_epoch, 
                     validation_steps=validation_steps, 
-                    epochs=2, 
+                    epochs=17, 
                     callbacks=callbacks)
 
 # Evaluate the model on the test dataset
 test_results = model.evaluate(test_dataset)
 print(f"Test results - Loss: {test_results[0]}, Accuracy: {test_results[1]}")
 
-# Preprocess and predict for a test image
-test_image, test_label = preprocess_image_label(image_paths_test[0], label_paths_test[0])
-prediction = model.predict(np.expand_dims(test_image, axis=0))
+'''
+def visualize(label_path):
+    label = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+    plt.imshow(label, cmap='nipy_spectral')
+    plt.title("Raw Label Image")
+    plt.axis('off')
+    plt.show()
+'''
 
-# Visualize the result
-visualize_prediction(test_image, test_label, prediction)
+for idx in [0, 10, 20, 40, 65, 80, 100, 120]:  # Adjust indices to test different images   
+    test_image, test_label = preprocess_image_label(image_paths_test[idx], label_paths_test[idx]) 
+    print(f"Testing image: {image_paths_test[idx]}, Label: {label_paths_test[idx]}")
+    print(f"Unique labels for Test Image: {np.unique(np.argmax(test_label, axis=-1))}")
+    prediction = model.predict(np.expand_dims(test_image, axis=0))
+    visualize_prediction(test_image, prediction)
 
 # Plot the training history
 plot_training_history(history)
-
-
-#SADELEŞTİRRRR
